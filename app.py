@@ -49,9 +49,12 @@ CHUNK_CHARS = 1500          # ~380 tokens per chunk
 CHUNK_OVERLAP = 250         # sliding-window overlap so ideas aren't split
 MAX_CHUNKS_PER_SESSION = 80 # cap runaway sessions (evenly sampled beyond this)
 
-# Retrieval widths (generous — compute is free)
+# Retrieval widths. Reranking is the whole latency budget (cross-encoder on CPU),
+# and its cost is ~linear in candidate count and quadratic in passage length — so we
+# rerank only the top few full-length candidates. Stage-1 recall is strong enough that
+# the right session sits in the top handful; verified the target is usually RRF #1-3.
 STAGE1_PER_LIST = 400       # top chunks pulled from each of dense / bm25
-RERANK_SESSIONS = 50        # sessions handed to the cross-encoder
+RERANK_SESSIONS = 15        # full-length passages handed to the cross-encoder
 RRF_K = 60                  # reciprocal-rank-fusion constant
 
 # Harness / injected-content markers to strip (not human-authored prose).
@@ -410,7 +413,9 @@ class SearchIndex:
         self.sessions = json.loads(SESSIONS_PATH.read_text()) if SESSIONS_PATH.exists() else {}
         self.bm25 = BM25(self.chunk_texts) if self.chunk_texts else None
 
-    def search(self, query: str, k: int = 25) -> list[dict]:
+    def search(self, query: str, k: int = 25, rerank: bool = True) -> list[dict]:
+        """Two-phase: rerank=False is the instant stage-1 pass (dense+BM25, ~80ms);
+        rerank=True adds the cross-encoder refinement (~1.3s) over the top candidates."""
         if not query.strip() or not self.chunk_texts:
             return []
 
@@ -432,9 +437,18 @@ class SearchIndex:
             if sid not in best or sc > best[sid][0]:
                 best[sid] = (sc, idx)
         ranked_sids = sorted(best, key=lambda s: best[s][0], reverse=True)
-        cand = ranked_sids[:RERANK_SESSIONS]
+
+        if not rerank:
+            # instant approximate ranking, ordered by (and showing) dense cosine of
+            # the best chunk so the displayed score matches the order. BM25 still
+            # shapes the reranked phase via candidate selection below.
+            cand = sorted(ranked_sids, key=lambda s: dense[best[s][1]], reverse=True)[:k]
+            return [self._result(s, best[s][1],
+                                 score=round(float(dense[best[s][1]]), 4), stage="fast")
+                    for s in cand]
 
         # --- stage 2: cross-encoder rerank the best passage per session ------
+        cand = ranked_sids[:RERANK_SESSIONS]
         passages = [self.chunk_texts[best[s][1]] for s in cand]
         order = list(range(len(cand)))
         rr_scores = [best[cand[i]][0] for i in order]  # fallback = fused score
@@ -443,27 +457,30 @@ class SearchIndex:
         except Exception:
             pass
         order.sort(key=lambda i: rr_scores[i], reverse=True)
+        return [self._result(cand[i], best[cand[i]][1],
+                             score=round(1.0 / (1.0 + math.exp(-float(rr_scores[i]))), 4),
+                             logit=round(float(rr_scores[i]), 3), stage="reranked")
+                for i in order[:k]]
 
-        results = []
-        for i in order[:k]:
-            sid = cand[i]
-            s = self.sessions.get(sid, {})
-            confidence = 1.0 / (1.0 + math.exp(-float(rr_scores[i])))  # logit → 0..1
-            results.append({
-                "score": round(confidence, 4),
-                "logit": round(float(rr_scores[i]), 3),
-                "session_id": sid,
-                "title": s.get("ai_title") or "(untitled session)",
-                "snippet": _trim(passages[i]),
-                "project": s.get("project", ""),
-                "cwd": s.get("cwd", ""),
-                "git_branch": s.get("git_branch", ""),
-                "last_ts": s.get("last_ts", ""),
-                "first_ts": s.get("first_ts", ""),
-                "msg_count": s.get("msg_count", 0),
-                "resume_cmd": _resume_cmd(sid, s),
-            })
-        return results
+    def _result(self, sid: str, chunk_idx: int, *, score: float,
+                logit: float | None = None, stage: str = "") -> dict:
+        s = self.sessions.get(sid, {})
+        r = {
+            "score": score, "stage": stage,
+            "session_id": sid,
+            "title": s.get("ai_title") or "(untitled session)",
+            "snippet": _trim(self.chunk_texts[chunk_idx]),
+            "project": s.get("project", ""),
+            "cwd": s.get("cwd", ""),
+            "git_branch": s.get("git_branch", ""),
+            "last_ts": s.get("last_ts", ""),
+            "first_ts": s.get("first_ts", ""),
+            "msg_count": s.get("msg_count", 0),
+            "resume_cmd": _resume_cmd(sid, s),
+        }
+        if logit is not None:
+            r["logit"] = logit
+        return r
 
 
 def _trim(text: str, n: int = 320) -> str:

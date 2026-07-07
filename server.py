@@ -52,8 +52,11 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             q = (qs.get("q", [""])[0]).strip()
             k = int(qs.get("k", ["20"])[0])
-            results = _get_index().search(q, k=k)
-            self._json({"query": q, "count": len(results), "results": results})
+            # fast=1 → instant stage-1 only (no cross-encoder rerank)
+            rerank = qs.get("fast", ["0"])[0] not in ("1", "true")
+            results = _get_index().search(q, k=k, rerank=rerank)
+            self._json({"query": q, "count": len(results),
+                        "reranked": rerank, "results": results})
             return
         if parsed.path == "/api/stats":
             idx = _get_index()

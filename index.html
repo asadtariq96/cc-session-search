@@ -105,20 +105,39 @@ function shortProject(p) {
 }
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
-async function search(q) {
-  q = q.trim();
-  lastQuery = q;
-  if (!q) { results.innerHTML = ""; meta.textContent = "Type to search."; return; }
-  meta.textContent = "Searching…";
+// Two-phase search: instant stage-1 (fast=1) as you type, then a cross-encoder
+// refine once you pause. Stale responses (query changed) are discarded.
+async function runSearch(q, fast) {
+  const r = await fetch(`/api/search?k=25&fast=${fast?1:0}&q=` + encodeURIComponent(q));
+  return r.json();
+}
+
+async function doFast(q) {
+  if (q !== lastQuery) return;
   try {
-    const r = await fetch("/api/search?k=25&q=" + encodeURIComponent(q));
-    const data = await r.json();
-    if (data.query !== lastQuery) return; // stale response
-    render(data.results);
-    meta.textContent = data.count + " matches — ranked by semantic similarity";
-  } catch (e) {
-    meta.textContent = "Search failed: " + e;
-  }
+    const d = await runSearch(q, true);
+    if (d.query !== lastQuery) return;
+    render(d.results);
+    meta.innerHTML = `${d.count} matches — <span style="color:var(--accent2)">refining ranking…</span>`;
+  } catch (e) { meta.textContent = "Search failed: " + e; }
+}
+
+async function doRerank(q) {
+  if (q !== lastQuery) return;
+  try {
+    const d = await runSearch(q, false);
+    if (d.query !== lastQuery) return;
+    render(d.results);
+    meta.textContent = `${d.count} matches — reranked by relevance`;
+  } catch (e) { /* keep the fast results shown */ }
+}
+
+// Combined (used by Enter / reindex): instant then refine.
+async function search(q) {
+  q = q.trim(); lastQuery = q;
+  if (!q) { results.innerHTML = ""; meta.textContent = "Type to search."; return; }
+  await doFast(q);
+  await doRerank(q);
 }
 
 function render(rows) {
@@ -159,11 +178,18 @@ async function openIterm(cwd, id){
   } catch(e){ showToast("Failed: " + e, true); }
 }
 
+let rerankTimer = null;
 $("#q").addEventListener("input", e => {
-  clearTimeout(timer);
-  timer = setTimeout(() => search(e.target.value), 250);
+  const q = e.target.value.trim();
+  lastQuery = q;
+  clearTimeout(timer); clearTimeout(rerankTimer);
+  if (!q) { results.innerHTML = ""; meta.textContent = "Type to search."; return; }
+  timer = setTimeout(() => doFast(q), 150);          // instant, as you type
+  rerankTimer = setTimeout(() => doRerank(q), 600);  // refine once you pause
 });
-$("#q").addEventListener("keydown", e => { if (e.key === "Enter") { clearTimeout(timer); search(e.target.value); }});
+$("#q").addEventListener("keydown", e => {
+  if (e.key === "Enter") { clearTimeout(timer); clearTimeout(rerankTimer); search(e.target.value); }
+});
 
 $("#reindex").addEventListener("click", async () => {
   meta.textContent = "Reindexing (scanning ~/.claude/projects)…";

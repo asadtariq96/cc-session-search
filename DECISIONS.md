@@ -126,3 +126,32 @@ production search engines use. Rationale for each change:
 **Cost of all this:** first index build downloads ~2.3GB of models and embeds a few
 thousand chunks (minutes); each query now runs dense + BM25 + a cross-encoder over ~50
 candidates (~1–2s). Accepted deliberately in exchange for accuracy.
+
+---
+
+# v3 — Latency (search felt slow: 5–9s per query)
+
+Profiled it: **the cross-encoder rerank was ~99.9% of latency** (8–9.4s); query embed,
+dense matmul, BM25, and fusion together were <100ms. Cross-encoder cost is ~linear in
+candidate count and ~quadratic in passage length. Fixes:
+
+### 16. Rerank fewer, full-length candidates (not 50)
+- `RERANK_SESSIONS` 50 → **15**. Stage-1 recall (dense+BM25/RRF) reliably puts the
+  right session in the top few (measured: usually RRF #1–3), so reranking 15 loses no
+  quality. Verified the DCP-panic query still ranks correctly at n=15.
+- **Kept passages full-length** — truncating to 500 chars sped things up but *cut the
+  matching region* and demoted the right answer, so truncation was rejected.
+- Rejected switching to the faster `jina-turbo` reranker: 4–5× faster but visibly
+  worse ordering (put a display-layout session above the actual crash session). Kept
+  the sharper `jina-reranker-v2`. Confirmed ONNX already uses all 16 cores (a `threads`
+  bump did nothing), so model choice + candidate count are the only real levers.
+- Net: ~9s → ~1.3–1.6s for the reranked pass.
+
+### 17. Two-phase search (instant + refine) — the actual UX fix
+- `GET /api/search?fast=1` returns **stage-1 only** (dense+BM25) in **~20ms**.
+- The UI runs the fast pass ~150ms after a keystroke (results appear as you type),
+  then fires the full reranked pass ~600ms after you *stop* typing; the reranked
+  result quietly replaces the approximate one. Perceived latency ≈ 20ms.
+- Safe because responses are discarded when the query has moved on (`query !== lastQuery`).
+- Fast-phase results are ordered by (and display) dense cosine so the shown score
+  matches the order; the reranked phase shows a sigmoid'd cross-encoder confidence.
