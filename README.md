@@ -38,12 +38,20 @@ uv run python app.py serve --no-open       # don't auto-open browser
 uv run python app.py serve --port 9000     # custom port
 ```
 
-## How it works
-`~/.claude/projects/**/*.jsonl` → parse each session's gist (AI title + key prompts,
-harness noise stripped) → embed locally with `BAAI/bge-small-en-v1.5` (via fastembed)
-→ store one normalized numpy matrix → query = cosine similarity top-k. Incremental:
-only new/changed sessions get re-embedded.
+## How it works (two-stage, multi-vector — all local)
+1. Parse every `~/.claude/projects/**/*.jsonl`; strip harness/skill noise.
+2. **Chunk** each session (your prompts + Claude's replies) into overlapping windows
+   and embed *every* chunk locally with `BAAI/bge-large-en-v1.5` (1024-dim, fastembed).
+3. **Stage 1 — recall:** query is scored by dense cosine **and** a numpy BM25, fused
+   with Reciprocal Rank Fusion; a session scores by its best-matching chunk.
+4. **Stage 2 — precision:** the top ~50 sessions are reranked by a cross-encoder
+   (`jina-reranker-v2`) that reads query + passage together.
+5. Results show the matching passage; embeddings are cached by content hash so reindex
+   only embeds genuinely new text.
+
+See [`DECISIONS.md`](DECISIONS.md) for why each piece exists.
 
 ## Requirements
 - [`uv`](https://github.com/astral-sh/uv) (already installed)
-- First run downloads the embedding model (~130MB, one time, cached)
+- First run downloads models (~2.3GB total: bge-large + reranker), one time, cached.
+  Indexing embeds a few thousand chunks (minutes); queries take ~1–2s.

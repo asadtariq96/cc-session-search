@@ -57,7 +57,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/stats":
             idx = _get_index()
-            self._json({"sessions": len(idx.meta)})
+            self._json({"sessions": len(idx.sessions), "chunks": len(idx.chunk_texts)})
             return
         self._json({"error": "not found"}, 404)
 
@@ -111,16 +111,19 @@ def _launch_iterm(cwd: str, session_id: str) -> tuple[bool, str]:
 
 
 def serve(port: int = 8422, open_browser: bool = True, reindex: bool = False):
-    if reindex or not core.EMB_PATH.exists():
+    if reindex or not core.CHUNK_EMB_PATH.exists():
         core.build_index()
-    # warm the model + index up front so first search is instant
+    # warm models + index up front so the first search is instant
+    print("[serve] loading index + models (dense + reranker)…", flush=True)
     _get_index()
     core.get_model()
+    core.get_reranker()
 
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}/"
-    print(f"[serve] cc-session-search ready → {url}  ({len(_get_index().meta)} sessions)",
-          flush=True)
+    idx = _get_index()
+    print(f"[serve] cc-session-search ready → {url}  "
+          f"({len(idx.sessions)} sessions / {len(idx.chunk_texts)} chunks)", flush=True)
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

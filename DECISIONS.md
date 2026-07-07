@@ -75,6 +75,54 @@ without the exact title — and get its **session ID** to `claude --resume`.
   tells you to use the copy button.
 
 ## Not done (deliberately, YAGNI)
-- No fuzzy/keyword hybrid ranking — pure semantic, as requested.
 - No auth (localhost, single user).
 - No background auto-reindex daemon — reindex is a button / `--reindex` flag.
+- No LLM query-expansion / HyDE — powerful, but needs an LLM; none local, and I
+  won't send queries to an external API without asking. Candidate future upgrade.
+
+---
+
+# v2 — Quality upgrade (compute is explicitly not a concern)
+
+Reworked from single-vector to **multi-vector + two-stage retrieval**, the pattern
+production search engines use. Rationale for each change:
+
+### 10. Chunk whole sessions; index every chunk (multi-vector)
+- **Was:** one embedding per session from a 4000-char gist — the rest of the session
+  was **truncated away** and unsearchable.
+- **Now:** each session is sliced into overlapping ~1500-char windows (250 overlap)
+  over *both* your prompts and Claude's replies; every window is embedded. A session
+  scores by its **best-matching chunk**. On the real corpus this went from 181 vectors
+  to ~5000 chunks — the thing you half-remember is now in the index even if it was at
+  message 200. The matching passage is shown as the result snippet so you recognise it.
+- Per-session chunk cap (80, evenly sampled) bounds runaway 500-message sessions.
+
+### 11. Cross-encoder reranker (stage 2)
+- **Model:** `jinaai/jina-reranker-v2-base-multilingual` (handles code + mixed text).
+- Stage 1 (dense+BM25) returns ~50 candidate sessions; the cross-encoder reads
+  `(query, best-passage)` **jointly** and reorders them. Cross-encoders are far more
+  accurate than cosine but too slow to run on everything — hence candidates-then-rerank.
+- Falls back to the fused stage-1 score if the reranker errors (never hard-fails).
+
+### 12. Bigger embedding model
+- `bge-small-en-v1.5` (384-dim) → **`bge-large-en-v1.5` (1024-dim)**. Strictly better
+  stage-1 recall; download/compute cost irrelevant per the brief.
+
+### 13. Hybrid dense + BM25 (RRF fusion)
+- Added a **pure-numpy Okapi BM25** (no new dependency, fully offline) over the chunks,
+  fused with dense ranking via **Reciprocal Rank Fusion**. Rescues cases where you
+  remember an exact token (a repo, an error string, "renovate") that the dense model
+  ranks poorly. It augments — never replaces — semantic ranking.
+
+### 14. Content-hash embedding cache
+- Every chunk's vector is cached by `sha1(text)`. Reindex re-embeds only genuinely new
+  chunk text; unchanged sessions are free. Cache is pruned to the current chunk set on
+  every build so it can't grow unbounded.
+
+### 15. Stronger cleaning
+- Also strips injected skill dumps (`Base directory for this skill:`) and file/CLAUDE.md
+  dumps (`Contents of `), which previously polluted the gist embedding.
+
+**Cost of all this:** first index build downloads ~2.3GB of models and embeds a few
+thousand chunks (minutes); each query now runs dense + BM25 + a cross-encoder over ~50
+candidates (~1–2s). Accepted deliberately in exchange for accuracy.
