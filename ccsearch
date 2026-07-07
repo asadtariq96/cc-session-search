@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Launch semantic Claude Code session search: refresh index, then open the GUI.
+cd "$(dirname "$0")" || exit 1
+exec uv run python app.py serve --reindex "$@"
