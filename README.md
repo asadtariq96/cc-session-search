@@ -1,57 +1,95 @@
 # cc-session-search
 
-Semantic (meaning-based, **not** keyword) search over your old Claude Code chat
-sessions. Describe what you remember a session was *about* and get its **session ID**
-and a ready-to-run `claude --resume` command — even if you don't recall the title.
+Search your old Claude Code sessions by what you remember them being about, not by the words you
+happen to type. You get the session ID and a `claude --resume` line you can paste.
 
-Everything runs **locally and offline**. Session content never leaves your Mac.
-See [`DECISIONS.md`](DECISIONS.md) for design rationale.
+Everything runs on your machine. No API calls, no server, no telemetry. The models ship as
+weights you download once.
+
+## The problem
+
+Claude Code stores every session under `~/.claude/projects/**/*.jsonl`. Those files are large,
+undated in any useful way, and named after a project directory you have since renamed. Keyword
+search fails on the obvious query, because what you remember is "that session where I fixed the
+timezone bug in the invoice PDF", and the transcript says "the date came out a day early".
+
+Meaning-based retrieval is the right tool and it is entirely doable locally on an M-series laptop.
+
+## How it works
+
+```mermaid
+flowchart TB
+  subgraph ingest["Index, once per new session"]
+    A["~/.claude/projects/**/*.jsonl"] --> B["strip harness noise,<br/>keep prompts and replies"]
+    B --> C["overlapping chunks"]
+    C --> D["BAAI/bge-large-en-v1.5<br/>1024-dim, fastembed"]
+    D --> E[("index<br/>SQLite-free, numpy arrays")]
+    C --> F[("BM25<br/>inverted index")]
+    E -.-> G["embedding cache<br/>keyed by content hash"]
+  end
+
+  subgraph query["Query, 1 to 2 seconds"]
+    Q["your description"] --> Q1["dense cosine"]
+    Q --> Q2["BM25"]
+    E --> Q1
+    F --> Q2
+    Q1 --> R["Reciprocal Rank Fusion<br/>session scores by its best chunk"]
+    Q2 --> R
+    R --> T["top 50 sessions"]
+    T --> X["jina-reranker-v2<br/>cross-encoder"]
+    X --> OUT["id, title, project,<br/>matching passage"]
+  end
+```
+
+Retrieval runs twice on purpose. The cheap stage has to be generous because chunk embeddings
+misfire on short queries; the expensive stage only ever sees 50 candidates, which is why the whole
+round trip still lands under two seconds. Reciprocal Rank Fusion merges the two rankings without
+asking which one is better, because on any given query neither is.
+
+Embeddings are keyed by a hash of the chunk text, so reindexing only embeds what is genuinely new.
+A cold start downloads about 2.3 GB of model weights once. After that, indexing a few thousand
+chunks takes minutes and a query takes one to two seconds.
+
+`DECISIONS.md` records why each piece exists, including the alternatives that lost.
 
 ## Use it
 
 ```bash
-~/Developer/cc-session-search/ccsearch
+git clone https://github.com/asadtariq96/cc-session-search.git
+cd cc-session-search
+./ccsearch                 # reindex new sessions, then open http://127.0.0.1:8422
 ```
 
-This reindexes new/changed sessions, then opens the GUI in your browser
-(`http://127.0.0.1:8422`). Type what you remember; results rank by meaning.
-
-Optional alias:
+`ccsearch` is a four-line shell wrapper so you can put it on `PATH`:
 
 ```bash
-echo "alias ccsearch='~/Developer/cc-session-search/ccsearch'" >> ~/.zshrc
+echo "alias ccsearch='$PWD/ccsearch'" >> ~/.zshrc
 ```
 
-## What you get per result
-- The Claude-generated **title** + a snippet of your opening prompt
-- **Project** dir, git branch, date, message count
-- **⧉ Copy resume command** → `cd "<cwd>" && claude --resume <id>` (paste in a terminal)
-- **⧉ Copy ID** → just the session ID
-- **▸ Open in iTerm2** → opens a new tab and resumes it (best-effort)
+Underneath it is a single command with subcommands if you would rather drive it yourself:
 
-## Commands
-```bash
-uv run python app.py index                 # (re)build the index only
-uv run python app.py serve                 # serve GUI (no reindex)
-uv run python app.py serve --reindex       # reindex then serve
-uv run python app.py serve --no-open       # don't auto-open browser
-uv run python app.py serve --port 9000     # custom port
-```
+| Command | Effect |
+| --- | --- |
+| `uv run python app.py index` | Rebuild the index |
+| `uv run python app.py serve` | Serve the page, no reindex |
+| `uv run python app.py serve --reindex` | Reindex, then serve |
+| `uv run python app.py serve --port 9000` | Pick a port |
+| `uv run python app.py serve --no-open` | Do not open a browser |
 
-## How it works (two-stage, multi-vector — all local)
-1. Parse every `~/.claude/projects/**/*.jsonl`; strip harness/skill noise.
-2. **Chunk** each session (your prompts + Claude's replies) into overlapping windows
-   and embed *every* chunk locally with `BAAI/bge-large-en-v1.5` (1024-dim, fastembed).
-3. **Stage 1 — recall:** query is scored by dense cosine **and** a numpy BM25, fused
-   with Reciprocal Rank Fusion; a session scores by its best-matching chunk.
-4. **Stage 2 — precision:** the top ~50 sessions are reranked by a cross-encoder
-   (`jina-reranker-v2`) that reads query + passage together.
-5. Results show the matching passage; embeddings are cached by content hash so reindex
-   only embeds genuinely new text.
+Requirements are `uv` and Python 3.12. The only Python dependencies are `fastembed` and `numpy`;
+there is no framework and no database.
 
-See [`DECISIONS.md`](DECISIONS.md) for why each piece exists.
+## What a result gives you
 
-## Requirements
-- [`uv`](https://github.com/astral-sh/uv) (already installed)
-- First run downloads models (~2.3GB total: bge-large + reranker), one time, cached.
-  Indexing embeds a few thousand chunks (minutes); queries take ~1–2s.
+The Claude-generated title, the opening prompt, the project directory, the git branch, the date,
+and the message count, plus three actions:
+
+- copy the resume command, `cd "<cwd>" && claude --resume <id>`
+- copy the bare session ID
+- open it in a new iTerm2 tab, best effort
+
+## Limits
+
+Indexing reads whatever is on disk, so a session you deleted stays searchable until the next
+rebuild. The cross-encoder rerank is the slow half of a query, which is the price of the second
+stage being useful at all. There is no incremental delete.
