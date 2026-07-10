@@ -42,13 +42,14 @@ flowchart TB
 ```
 
 Retrieval runs twice on purpose. The cheap stage has to be generous because chunk embeddings
-misfire on short queries; the expensive stage only ever sees 50 candidates, which is why the whole
-round trip still lands under two seconds. Reciprocal Rank Fusion merges the two rankings without
-asking which one is better, because on any given query neither is.
+misfire on short queries; the expensive stage only ever sees the top candidates. The two phases
+answer separately, so the page paints after about 80ms with the fused ranking and then settles
+roughly 1.3s later once the cross-encoder has had its say. Reciprocal Rank Fusion merges the dense
+and BM25 rankings without asking which one is better, because on any given query neither is.
 
 Embeddings are keyed by a hash of the chunk text, so reindexing only embeds what is genuinely new.
 A cold start downloads about 2.3 GB of model weights once. After that, indexing a few thousand
-chunks takes minutes and a query takes one to two seconds.
+chunks takes minutes.
 
 `DECISIONS.md` records why each piece exists, including the alternatives that lost.
 
